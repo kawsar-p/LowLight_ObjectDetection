@@ -25,7 +25,7 @@ RUN_TIMESTAMP = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 OUTPUT_DIR = BASE_OUTPUT_DIR / f"run_{RUN_TIMESTAMP}"
 
 ORIGINAL_OUTPUT = OUTPUT_DIR / "original"
-ENHANCED_OUTPUT = OUTPUT_DIR / "enhanced"
+ENHANCED_DETECTION_OUTPUT = OUTPUT_DIR / "enhanced_detection"
 FINAL_OUTPUT = OUTPUT_DIR / "final"
 
 MODEL_PATH = Path("FINAL_MODEL") / "best.pt"
@@ -48,6 +48,16 @@ UNKNOWN_THRESHOLD = 0.50
 MIN_IMPROVEMENT = 0.04
 
 IMAGE_SIZE = 640
+
+# ============================================================
+# BOUNDING-BOX EXCEPTION / SANITY FILTER
+# ============================================================
+# Reject only clearly abnormal YOLO boxes.
+# The model-generated box is NEVER resized or moved.
+MAX_BOX_AREA_RATIO = 0.75
+MIN_BOX_AREA_RATIO = 0.0005
+MAX_BOX_ASPECT_RATIO = 12.0
+MIN_BOX_ASPECT_RATIO = 1 / MAX_BOX_ASPECT_RATIO
 
 
 # ============================================================
@@ -691,6 +701,9 @@ def get_detections(
     if result.boxes is None:
         return detections
 
+    image_height, image_width = result.orig_shape[:2]
+    image_area = float(image_width * image_height)
+
     for box in result.boxes:
 
         confidence = float(
@@ -713,6 +726,71 @@ def get_detections(
             .cpu()
             .numpy()
         )
+
+        # ====================================================
+        # BOUNDING-BOX EXCEPTION
+        # ====================================================
+        # Do not shrink/move the YOLO box.
+        # Reject only clearly abnormal boxes.
+        # ====================================================
+
+        x1, y1, x2, y2 = [
+            float(v)
+            for v in xyxy
+        ]
+
+        box_width = max(
+            0.0,
+            min(x2, image_width) - max(x1, 0.0)
+        )
+
+        box_height = max(
+            0.0,
+            min(y2, image_height) - max(y1, 0.0)
+        )
+
+        area_ratio = (
+            (box_width * box_height)
+            / image_area
+        )
+
+        if (
+            box_width <= 1
+            or box_height <= 1
+            or area_ratio < MIN_BOX_AREA_RATIO
+        ):
+            print(
+                f"  [BOX EXCEPTION] {class_name} "
+                f"rejected: invalid/tiny box "
+                f"(area={area_ratio:.4f})"
+            )
+            continue
+
+        if area_ratio > MAX_BOX_AREA_RATIO:
+            print(
+                f"  [BOX EXCEPTION] {class_name} "
+                f"rejected: oversized box "
+                f"({area_ratio * 100:.1f}% of image)"
+            )
+            continue
+
+        aspect_ratio = (
+            box_width / box_height
+            if box_height > 0
+            else float("inf")
+        )
+
+        if (
+            aspect_ratio > MAX_BOX_ASPECT_RATIO
+            or
+            aspect_ratio < MIN_BOX_ASPECT_RATIO
+        ):
+            print(
+                f"  [BOX EXCEPTION] {class_name} "
+                f"rejected: abnormal aspect ratio "
+                f"({aspect_ratio:.2f})"
+            )
+            continue
 
         detections.append(
             {
@@ -1644,7 +1722,7 @@ def main():
         exist_ok=True
     )
 
-    ENHANCED_OUTPUT.mkdir(
+    ENHANCED_DETECTION_OUTPUT.mkdir(
         parents=True,
         exist_ok=True
     )
@@ -1669,7 +1747,7 @@ def main():
     print(
         "Original -> Adaptive Enhancement -> "
         "YOLO Original + YOLO Enhanced -> "
-        "Best Result -> Final"
+        "Enhanced Detection + Best Result -> Final"
     )
 
     # ========================================================
@@ -1823,29 +1901,6 @@ def main():
         )
 
         # ====================================================
-        # SAVE ENHANCED
-        # ====================================================
-
-        enhanced_path = (
-            ENHANCED_OUTPUT
-            /
-            f"{image_path.stem}_enhanced.jpg"
-        )
-
-        if not cv2.imwrite(
-            str(enhanced_path),
-            enhanced,
-            [
-                cv2.IMWRITE_JPEG_QUALITY,
-                95
-            ]
-        ):
-
-            print(
-                "WARNING: Failed to save enhanced image."
-            )
-
-        # ====================================================
         # ORIGINAL YOLO
         # ====================================================
 
@@ -1908,6 +1963,54 @@ def main():
             f"Enhanced score: "
             f"{enhanced_score:.3f}"
         )
+
+        # ====================================================
+        # SAVE ENHANCED DETECTION
+        # ====================================================
+        # Always save the enhanced image with its own YOLO
+        # detections, regardless of the final Original/Enhanced
+        # decision.
+        # ====================================================
+
+        if enhanced_detections:
+
+            enhanced_detection_image = draw_final_result(
+                enhanced,
+                enhanced_detections,
+                "ENHANCED"
+            )
+
+        else:
+
+            enhanced_detection_image = create_unknown_image(
+                enhanced
+            )
+
+        enhanced_detection_path = (
+            ENHANCED_DETECTION_OUTPUT
+            /
+            f"{image_path.stem}_enhanced_detection.jpg"
+        )
+
+        if not cv2.imwrite(
+            str(enhanced_detection_path),
+            enhanced_detection_image,
+            [cv2.IMWRITE_JPEG_QUALITY, 95]
+        ):
+
+            print(
+                "WARNING: Failed to save enhanced detection image."
+            )
+
+        else:
+
+            print(
+                "ENHANCED DETECTION SAVED:"
+            )
+
+            print(
+                enhanced_detection_path
+            )
 
         # ====================================================
         # FINAL DECISION
@@ -2204,14 +2307,6 @@ def main():
 
     print(
         ORIGINAL_OUTPUT.resolve()
-    )
-
-    print(
-        "\nEnhanced images:"
-    )
-
-    print(
-        ENHANCED_OUTPUT.resolve()
     )
 
     print(
